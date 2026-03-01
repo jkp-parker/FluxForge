@@ -26,12 +26,19 @@ export const browseNode = (id, nodeId) =>
 export const startScan = (id) => api.post(`/devices/${id}/scan`).then(r => r.data)
 export const getScanStatus = (id) => api.get(`/devices/${id}/scan`).then(r => r.data)
 export const clearScan = (id) => api.delete(`/devices/${id}/scan`).then(r => r.data)
+export const readTagValues = (id, nodeIds) => api.post(`/devices/${id}/read-values`, nodeIds).then(r => r.data)
 export const getDeviceTags = (id) => api.get(`/devices/${id}/tags`).then(r => r.data)
 export const saveDeviceTags = (id, tags) => api.put(`/devices/${id}/tags`, { tags }).then(r => r.data)
 export const patchTag = (deviceId, tagId, data) =>
   api.patch(`/devices/${deviceId}/tags/${tagId}`, data).then(r => r.data)
 export const deleteTag = (deviceId, tagId) =>
   api.delete(`/devices/${deviceId}/tags/${tagId}`).then(r => r.data)
+
+// Node Includes (branch subscriptions)
+export const getDeviceNodeIncludes = (id) => api.get(`/devices/${id}/node-includes`).then(r => r.data)
+export const createNodeInclude = (deviceId, data) => api.post(`/devices/${deviceId}/node-includes`, data).then(r => r.data)
+export const patchNodeInclude = (deviceId, id, data) => api.patch(`/devices/${deviceId}/node-includes/${id}`, data).then(r => r.data)
+export const deleteNodeInclude = (deviceId, id) => api.delete(`/devices/${deviceId}/node-includes/${id}`).then(r => r.data)
 
 // Scan Classes
 export const listScanClasses = () => api.get('/scan-classes').then(r => r.data)
@@ -51,6 +58,10 @@ export const testInfluxConnectionRaw = (data) => api.post('/influxdb/test-connec
 export const listBuckets = (id) => api.get(`/influxdb/${id}/buckets`).then(r => r.data)
 
 // Telegraf
-export const getTelegrafConfig = () => api.get('/telegraf/config').then(r => r.data)
+export const getTelegrafConfig = () => api.get('/telegraf/config')
+export const previewTelegrafImport = (content) => api.post('/telegraf/import/preview', { content }).then(r => r.data)
+export const confirmTelegrafImport = (data) => api.post('/telegraf/import/confirm', data).then(r => r.data)
+export const saveTelegrafOverride = (content) => api.put('/telegraf/config/override', { content }).then(r => r.data)
+export const revertTelegrafOverride = () => api.delete('/telegraf/config/override').then(r => r.data)
 
 export default api

@@ -1,14 +1,16 @@
-import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
+import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
-  Tag, Search, Loader2, CheckSquare, Square, SortAsc, SortDesc,
+  Tag, Search, Loader2, CheckSquare, Square, MinusSquare, SortAsc, SortDesc,
   ChevronDown, ChevronRight, Trash2, Power, PowerOff, Filter,
-  Plus, GripVertical,
+  Plus, GripVertical, RefreshCw, FolderClosed, Server, ChevronsUpDown, ChevronsDownUp, Activity,
 } from 'lucide-react'
 import {
   listDevices, getDeviceTags, saveDeviceTags, listScanClasses,
-  patchTag, deleteTag, getScanStatus,
+  patchTag, deleteTag, getScanStatus, startScan, readTagValues,
+  getDeviceNodeIncludes, createNodeInclude, patchNodeInclude, deleteNodeInclude as deleteNodeIncludeApi,
 } from '../services/api'
+import Modal from '../components/Modal'
 
 function matchGlob(pattern, text) {
   if (!pattern) return true
@@ -56,6 +58,124 @@ function useResizableColumns(defaultWidths) {
   return { widths, onMouseDown }
 }
 
+// ── Tree builder ──
+function buildTree(tags) {
+  const deviceMap = new Map()
+  const folderMaps = new Map() // device_id -> Map<path, folderNode>
+
+  for (const tag of tags) {
+    if (!deviceMap.has(tag.device_id)) {
+      deviceMap.set(tag.device_id, {
+        type: 'device',
+        id: `device:${tag.device_id}`,
+        label: tag.device_name,
+        device_id: tag.device_id,
+        children: [],
+      })
+      folderMaps.set(tag.device_id, new Map())
+    }
+
+    const deviceNode = deviceMap.get(tag.device_id)
+    const fMap = folderMaps.get(tag.device_id)
+    const parts = (tag.path || tag.display_name).split('/')
+
+    let parent = deviceNode
+    let pathSoFar = ''
+
+    for (let i = 0; i < parts.length - 1; i++) {
+      pathSoFar = pathSoFar ? `${pathSoFar}/${parts[i]}` : parts[i]
+      const folderKey = `${tag.device_id}:${pathSoFar}`
+
+      if (!fMap.has(folderKey)) {
+        const folder = {
+          type: 'folder',
+          id: folderKey,
+          label: parts[i],
+          path: pathSoFar,
+          device_id: tag.device_id,
+          children: [],
+        }
+        fMap.set(folderKey, folder)
+        parent.children.push(folder)
+      }
+      parent = fMap.get(folderKey)
+    }
+
+    parent.children.push({
+      type: 'tag',
+      id: `${tag.device_id}:${tag.node_id}`,
+      label: parts[parts.length - 1] || tag.display_name,
+      tag: tag,
+      device_id: tag.device_id,
+    })
+  }
+
+  return [...deviceMap.values()]
+}
+
+function getNodeStats(node) {
+  if (node.type === 'tag') {
+    return {
+      total: 1,
+      collected: node.tag.is_collected ? 1 : 0,
+      enabled: (node.tag.is_collected && node.tag.enabled) ? 1 : 0,
+    }
+  }
+  let total = 0, collected = 0, enabled = 0
+  for (const child of (node.children || [])) {
+    const s = getNodeStats(child)
+    total += s.total
+    collected += s.collected
+    enabled += s.enabled
+  }
+  return { total, collected, enabled }
+}
+
+function getAllLeafKeys(node) {
+  if (node.type === 'tag') return [`${node.tag.device_id}:${node.tag.node_id}`]
+  return (node.children || []).flatMap(c => getAllLeafKeys(c))
+}
+
+function getAllLeafTags(node) {
+  if (node.type === 'tag') return [node.tag]
+  return (node.children || []).flatMap(c => getAllLeafTags(c))
+}
+
+function collectAllNodeIds(node) {
+  const ids = [node.id]
+  for (const child of (node.children || [])) {
+    ids.push(...collectAllNodeIds(child))
+  }
+  return ids
+}
+
+function getVisibleLeafTags(tree, expanded) {
+  const tags = []
+  const walk = (nodes, parentExpanded) => {
+    for (const node of nodes) {
+      if (!parentExpanded) continue
+      if (node.type === 'tag') {
+        tags.push(node.tag)
+      } else if (node.children) {
+        walk(node.children, expanded.has(node.id))
+      }
+    }
+  }
+  walk(tree, true)
+  return tags
+}
+
+function formatLiveValue(entry) {
+  if (!entry) return <span className="text-gray-600">{'\u2014'}</span>
+  if (entry.status && entry.status !== 'Good' && entry.status.startsWith('Error'))
+    return <span className="text-red-400" title={entry.status}>err</span>
+  const v = entry.value
+  if (v === null || v === undefined) return <span className="text-gray-500">null</span>
+  if (typeof v === 'boolean') return <span className={v ? 'text-green-400' : 'text-red-400'}>{String(v)}</span>
+  if (typeof v === 'number') return <span className="text-cyan-400">{Number.isInteger(v) ? v : v.toFixed(4)}</span>
+  return <span className="text-gray-300">{String(v).slice(0, 30)}</span>
+}
+
 export default function TagManagement() {
   const [searchParams] = useSearchParams()
   const initialDeviceFilter = searchParams.get('device') || ''
@@ -65,6 +185,7 @@ export default function TagManagement() {
   const [scanClasses, setScanClasses] = useState([])
   const [loading, setLoading] = useState(true)
   const [savedTagsByDevice, setSavedTagsByDevice] = useState({})
+  const [nodeIncludesByDevice, setNodeIncludesByDevice] = useState({})
 
   // View mode
   const [viewMode, setViewMode] = useState('all')
@@ -88,17 +209,47 @@ export default function TagManagement() {
   // Bulk actions
   const [bulkScanClass, setBulkScanClass] = useState('')
 
-  // Grouping
-  const [groupBy, setGroupBy] = useState('none')
+  // Grouping / View style
+  const [groupBy, setGroupBy] = useState('tree')
   const [collapsedGroups, setCollapsedGroups] = useState(new Set())
 
-  // Column resize — default widths in px
-  const { widths: colWidths, onMouseDown: onColResize } = useResizableColumns([
+  // Refresh scanning
+  const [scanning, setScanning] = useState(false)
+
+  // Tree expand/collapse
+  const [expanded, setExpanded] = useState(new Set())
+
+  // Branch dialog
+  const [branchDialog, setBranchDialog] = useState(null)
+  const [branchScanClass, setBranchScanClass] = useState('')
+
+  // Live values
+  const [liveValues, setLiveValues] = useState({})  // { "node_id": { value, status, timestamp } }
+  const [liveEnabled, setLiveEnabled] = useState(false)
+  const liveIntervalRef = useRef(null)
+
+  // Column resize — tree layout
+  const { widths: treeColWidths, onMouseDown: onTreeColResize } = useResizableColumns([
+    36,   // checkbox
+    300,  // name (with indent)
+    100,  // value (live)
+    100,  // status / summary
+    50,   // ns
+    100,  // type
+    130,  // measurement
+    120,  // scan class
+    70,   // enabled
+    40,   // actions
+  ])
+
+  // Column resize — flat layout
+  const { widths: flatColWidths, onMouseDown: onFlatColResize } = useResizableColumns([
     36,   // checkbox
     90,   // status
     120,  // device
     160,  // tag name
-    240,  // path
+    200,  // path
+    100,  // value (live)
     50,   // ns
     100,  // type
     130,  // measurement
@@ -115,21 +266,27 @@ export default function TagManagement() {
       setScanClasses(scs)
 
       const perDevice = await Promise.all(devs.map(async (d) => {
-        const [tags, scanResult] = await Promise.all([
+        const [tags, scanResult, nodeIncludes] = await Promise.all([
           getDeviceTags(d.id),
           getScanStatus(d.id).catch(() => ({ status: 'none', nodes: [] })),
+          getDeviceNodeIncludes(d.id),
         ])
-        return { device: d, tags, scanNodes: scanResult.status === 'complete' ? (scanResult.nodes || []) : [] }
+        return {
+          device: d, tags,
+          scanNodes: scanResult.status === 'complete' ? (scanResult.nodes || []) : [],
+          nodeIncludes,
+        }
       }))
 
       const savedByDevice = {}
+      const niByDevice = {}
       const allMerged = []
 
-      for (const { device, tags, scanNodes } of perDevice) {
+      for (const { device, tags, scanNodes, nodeIncludes } of perDevice) {
         const savedByNodeId = new Map(tags.map(t => [t.node_id, t]))
         savedByDevice[device.id] = tags
+        niByDevice[device.id] = nodeIncludes
 
-        // Deduplicate scan nodes by node_id — skip if already seen for this device
         const seenNodeIds = new Set()
         for (const node of scanNodes) {
           if (seenNodeIds.has(node.node_id)) continue
@@ -155,7 +312,6 @@ export default function TagManagement() {
           })
         }
 
-        // Add saved tags that weren't in scan results
         for (const tag of tags) {
           if (!seenNodeIds.has(tag.node_id)) {
             allMerged.push({
@@ -179,10 +335,49 @@ export default function TagManagement() {
         }
       }
 
+      // Mark tags covered by enabled NodeIncludes as collected via branch subscription
+      for (const tag of allMerged) {
+        if (tag.is_collected) continue
+        const deviceIncludes = niByDevice[tag.device_id] || []
+        for (const ni of deviceIncludes) {
+          if (ni.enabled && tag.path) {
+            const prefix = ni.parent_path + '/'
+            if (tag.path.startsWith(prefix) || tag.path === ni.parent_path) {
+              tag.is_collected = true
+              tag.collected_via_include = true
+              break
+            }
+          }
+        }
+      }
+
       setSavedTagsByDevice(savedByDevice)
+      setNodeIncludesByDevice(niByDevice)
       setMergedTags(allMerged)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const refreshAllScans = async () => {
+    setScanning(true)
+    try {
+      const devs = devices.length ? devices : await listDevices()
+      await Promise.all(devs.map(d => startScan(d.id)))
+
+      const poll = () => new Promise((resolve) => {
+        const interval = setInterval(async () => {
+          const statuses = await Promise.all(devs.map(d => getScanStatus(d.id).catch(() => ({ status: 'error' }))))
+          if (statuses.every(s => s.status !== 'scanning')) {
+            clearInterval(interval)
+            resolve()
+          }
+        }, 1500)
+      })
+      await poll()
+      await loadAll()
+    } finally {
+      setScanning(false)
     }
   }
 
@@ -228,8 +423,61 @@ export default function TagManagement() {
       })
   }, [mergedTags, viewMode, search, wildcardPattern, filterDevice, filterScanClass, filterDataType, filterEnabled, filterNs, sortKey, sortDir])
 
+  // Build tree from filtered data
+  const tree = useMemo(() => buildTree(filtered), [filtered])
+
+  // Live value polling — only poll tags visible in expanded tree branches
+  const fetchLiveValues = useCallback(async () => {
+    if (!devices.length || !mergedTags.length) return
+    const tagsToRead = groupBy === 'tree'
+      ? getVisibleLeafTags(tree, expanded)
+      : mergedTags
+    if (!tagsToRead.length) return
+    const byDevice = new Map()
+    for (const t of tagsToRead) {
+      if (!byDevice.has(t.device_id)) byDevice.set(t.device_id, [])
+      byDevice.get(t.device_id).push(t.node_id)
+    }
+    const allValues = {}
+    await Promise.all([...byDevice.entries()].map(async ([deviceId, nodeIds]) => {
+      try {
+        const vals = await readTagValues(deviceId, nodeIds)
+        Object.assign(allValues, vals)
+      } catch { /* device offline — skip */ }
+    }))
+    setLiveValues(allValues)
+  }, [devices, mergedTags, groupBy, tree, expanded])
+
+  useEffect(() => {
+    if (liveIntervalRef.current) {
+      clearInterval(liveIntervalRef.current)
+      liveIntervalRef.current = null
+    }
+    if (liveEnabled) {
+      fetchLiveValues()
+      liveIntervalRef.current = setInterval(fetchLiveValues, 5000)
+    } else {
+      setLiveValues({})
+    }
+    return () => {
+      if (liveIntervalRef.current) clearInterval(liveIntervalRef.current)
+    }
+  }, [liveEnabled, fetchLiveValues])
+
+  // Build node include lookup map: "deviceId:path" -> include record
+  const nodeIncludeMap = useMemo(() => {
+    const map = {}
+    for (const [deviceId, includes] of Object.entries(nodeIncludesByDevice)) {
+      for (const ni of includes) {
+        map[`${deviceId}:${ni.parent_path}`] = ni
+      }
+    }
+    return map
+  }, [nodeIncludesByDevice])
+
+  // Groups for flat view
   const groups = useMemo(() => {
-    if (groupBy === 'none') return null
+    if (groupBy === 'tree' || groupBy === 'flat') return null
     const map = new Map()
     for (const tag of filtered) {
       let key
@@ -245,18 +493,45 @@ export default function TagManagement() {
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))
   }, [filtered, groupBy])
 
+  // Auto-expand when filtering
+  useEffect(() => {
+    if (search || wildcardPattern) {
+      const allIds = new Set()
+      const walk = (nodes) => {
+        for (const n of nodes) {
+          if (n.children) { allIds.add(n.id); walk(n.children) }
+        }
+      }
+      walk(tree)
+      setExpanded(allIds)
+    }
+  }, [search, wildcardPattern, tree])
+
   const toggleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
     else { setSortKey(key); setSortDir('asc') }
   }
 
-  // Use unique key per tag — include index as tiebreaker for any remaining edge cases
   const tKey = (t) => `${t.device_id}:${t.node_id}`
 
   const toggleSelect = (key) => {
     setSelected(s => {
       const next = new Set(s)
       next.has(key) ? next.delete(key) : next.add(key)
+      return next
+    })
+  }
+
+  const toggleSelectBranch = (node) => {
+    const leafKeys = getAllLeafKeys(node)
+    setSelected(prev => {
+      const next = new Set(prev)
+      const allSelected = leafKeys.every(k => next.has(k))
+      if (allSelected) {
+        for (const k of leafKeys) next.delete(k)
+      } else {
+        for (const k of leafKeys) next.add(k)
+      }
       return next
     })
   }
@@ -280,6 +555,27 @@ export default function TagManagement() {
       return next
     })
   }
+
+  const toggleExpand = (nodeId) => {
+    setExpanded(prev => {
+      const next = new Set(prev)
+      next.has(nodeId) ? next.delete(nodeId) : next.add(nodeId)
+      return next
+    })
+  }
+
+  const expandAll = () => {
+    const allIds = new Set()
+    const walk = (nodes) => {
+      for (const n of nodes) {
+        if (n.children) { allIds.add(n.id); walk(n.children) }
+      }
+    }
+    walk(tree)
+    setExpanded(allIds)
+  }
+
+  const collapseAll = () => setExpanded(new Set())
 
   // ── Actions for collected tags (patch/delete) ──
 
@@ -309,7 +605,7 @@ export default function TagManagement() {
       const existing = savedTagsByDevice[deviceId] || []
       const existingNodeIds = new Set(existing.map(t => t.node_id))
       const combined = [...existing]
-      const addedNodeIds = new Set() // Prevent duplicates within the batch
+      const addedNodeIds = new Set()
       for (const tag of newTags) {
         if (existingNodeIds.has(tag.node_id) || addedNodeIds.has(tag.node_id)) continue
         addedNodeIds.add(tag.node_id)
@@ -332,9 +628,47 @@ export default function TagManagement() {
     await loadAll()
   }
 
+  // ── Branch subscription ──
+
+  const handleAddBranchSubscription = async (node, scanClassId) => {
+    await createNodeInclude(node.device_id, {
+      device_id: node.device_id,
+      parent_node_id: `path:${node.path || node.label}`,
+      parent_path: node.path || node.label,
+      display_name: node.label,
+      scan_class_id: scanClassId || null,
+      enabled: true,
+    })
+    await loadAll()
+  }
+
+  const handlePatchNodeInclude = async (ni, field, value) => {
+    await patchNodeInclude(ni.device_id, ni.id, { [field]: value })
+    await loadAll()
+  }
+
+  const handleDeleteNodeInclude = async (ni) => {
+    await deleteNodeIncludeApi(ni.device_id, ni.id)
+    await loadAll()
+  }
+
   // ── Bulk actions ──
 
   const getSelectedTags = () => mergedTags.filter(t => selected.has(tKey(t)))
+
+  // Find the highest complete branch for dialog
+  const findCompleteBranch = (nodes) => {
+    for (const node of nodes) {
+      if (node.type === 'tag') continue
+      const leafKeys = getAllLeafKeys(node)
+      if (leafKeys.length >= 2 && leafKeys.every(k => selected.has(k))) {
+        return node
+      }
+      const deeper = findCompleteBranch(node.children || [])
+      if (deeper) return deeper
+    }
+    return null
+  }
 
   const handleBulkAddToCollection = async () => {
     const tags = getSelectedTags().filter(t => !t.is_collected)
@@ -342,6 +676,17 @@ export default function TagManagement() {
     const scId = bulkScanClass && bulkScanClass !== '__none__'
       ? Number(bulkScanClass)
       : (defaultScanClass?.id || null)
+
+    // Check for complete branch selection in tree view
+    if (groupBy === 'tree') {
+      const branch = findCompleteBranch(tree)
+      if (branch && branch.type === 'folder') {
+        setBranchDialog({ node: branch, uncollectedTags: tags, scanClassId: scId })
+        setBranchScanClass(scId ? String(scId) : '')
+        return
+      }
+    }
+
     await handleAddToCollection(tags, scId)
     setSelected(new Set())
   }
@@ -398,55 +743,280 @@ export default function TagManagement() {
     </div>
   )
 
-  // Resizable column header helper
-  const ResizeTh = ({ index, children, className = '' }) => (
-    <th className={`table-th relative ${className}`} style={{ width: colWidths[index], minWidth: 40 }}>
+  // ── Tree row rendering ──
+
+  const TreeResizeTh = ({ index, children, className = '' }) => (
+    <th className={`table-th relative ${className}`} style={{ width: treeColWidths[index], minWidth: 40 }}>
       {children}
       <div
         className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-blue-500/40 z-20"
-        onMouseDown={(e) => onColResize(index, e)}
+        onMouseDown={(e) => onTreeColResize(index, e)}
       />
     </th>
   )
 
-  const renderTagRow = (tag, idx) => {
+  const renderTreeRow = (node, depth) => {
+    const isExpanded = expanded.has(node.id)
+    const indent = depth * 20
+
+    if (node.type === 'tag') {
+      const tag = node.tag
+      const key = tKey(tag)
+      const isBranchCollected = tag.collected_via_include
+      return (
+        <tr key={node.id} className={`hover:bg-gray-800/50 ${selected.has(key) ? 'bg-blue-900/20' : ''}`}>
+          <td className="table-td" style={{ width: treeColWidths[0] }}>
+            {isBranchCollected ? (
+              <CheckSquare size={14} className="text-gray-600 cursor-not-allowed" title="Managed by branch subscription" />
+            ) : (
+              <button onClick={() => toggleSelect(key)}>
+                {selected.has(key)
+                  ? <CheckSquare size={14} className="text-blue-400" />
+                  : <Square size={14} className="text-gray-500" />}
+              </button>
+            )}
+          </td>
+          <td className="table-td" style={{ width: treeColWidths[1] }}>
+            <div className="flex items-center gap-1.5" style={{ paddingLeft: indent + 20 }}>
+              <Tag size={12} className={isBranchCollected ? 'text-purple-400 flex-shrink-0' : 'text-blue-400 flex-shrink-0'} />
+              <span className="truncate text-gray-200" title={tag.display_name}>{node.label}</span>
+            </div>
+          </td>
+          <td className="table-td font-mono text-xs truncate" style={{ width: treeColWidths[2] }} title={liveValues[tag.node_id]?.status}>
+            {liveEnabled ? formatLiveValue(liveValues[tag.node_id]) : <span className="text-gray-600">{'\u2014'}</span>}
+          </td>
+          <td className="table-td text-center" style={{ width: treeColWidths[3] }}>
+            {isBranchCollected
+              ? <span className="badge badge-purple">Branch</span>
+              : tag.is_collected
+                ? <span className="badge badge-green">Collected</span>
+                : <span className="badge badge-gray">Available</span>}
+          </td>
+          <td className="table-td text-center" style={{ width: treeColWidths[4] }}>
+            <span className="badge badge-gray">{tag.namespace}</span>
+          </td>
+          <td className="table-td text-xs text-gray-400 truncate" style={{ width: treeColWidths[5] }} title={tag.data_type}>
+            {tag.data_type || '\u2014'}
+          </td>
+          {isBranchCollected ? (
+            <>
+              <td className="table-td text-gray-600 text-xs italic" style={{ width: treeColWidths[6] }}>inherited</td>
+              <td className="table-td text-gray-600 text-xs italic" style={{ width: treeColWidths[7] }}>inherited</td>
+              <td className="table-td text-center" style={{ width: treeColWidths[8] }}>
+                <input type="checkbox" checked disabled
+                  className="rounded border-gray-700 bg-gray-800 text-gray-600 cursor-not-allowed" />
+              </td>
+              <td className="table-td text-right" style={{ width: treeColWidths[9] }}></td>
+            </>
+          ) : tag.is_collected ? (
+            <>
+              <td className="table-td" style={{ width: treeColWidths[6] }}>
+                <input className="input py-0.5 text-xs w-full"
+                  defaultValue={tag.measurement_name}
+                  onBlur={e => { if (e.target.value !== tag.measurement_name) handlePatch(tag, 'measurement_name', e.target.value) }}
+                  placeholder={tag.display_name} />
+              </td>
+              <td className="table-td" style={{ width: treeColWidths[7] }}>
+                <select className="input py-0.5 text-xs w-full"
+                  value={tag.scan_class_id || ''}
+                  onChange={e => handlePatch(tag, 'scan_class_id', e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">None</option>
+                  {scanClasses.map(sc => <option key={sc.id} value={sc.id}>{sc.name}</option>)}
+                </select>
+              </td>
+              <td className="table-td text-center" style={{ width: treeColWidths[8] }}>
+                <input type="checkbox" checked={tag.enabled}
+                  onChange={e => handlePatch(tag, 'enabled', e.target.checked)}
+                  className="rounded border-gray-600 bg-gray-800 text-blue-500" />
+              </td>
+              <td className="table-td text-right" style={{ width: treeColWidths[9] }}>
+                <button onClick={() => handleRemoveFromCollection(tag)} className="text-red-400 hover:text-red-300 p-1" title="Remove from collection">
+                  <Trash2 size={12} />
+                </button>
+              </td>
+            </>
+          ) : (
+            <>
+              <td className="table-td text-gray-600 text-xs" style={{ width: treeColWidths[6] }}>{'\u2014'}</td>
+              <td className="table-td text-gray-600 text-xs" style={{ width: treeColWidths[7] }}>{'\u2014'}</td>
+              <td className="table-td text-center text-gray-600" style={{ width: treeColWidths[8] }}>{'\u2014'}</td>
+              <td className="table-td text-right" style={{ width: treeColWidths[9] }}>
+                <button onClick={() => handleAddToCollection([tag], defaultScanClass?.id || null)} className="text-green-400 hover:text-green-300 p-1" title="Add to collection">
+                  <Plus size={12} />
+                </button>
+              </td>
+            </>
+          )}
+        </tr>
+      )
+    }
+
+    // Device or folder node
+    const stats = getNodeStats(node)
+    const niKey = `${node.device_id}:${node.path || ''}`
+    const ni = node.type === 'folder' ? nodeIncludeMap[niKey] : null
+    const leafKeys = getAllLeafKeys(node)
+    const allSel = leafKeys.length > 0 && leafKeys.every(k => selected.has(k))
+    const someSel = !allSel && leafKeys.some(k => selected.has(k))
+
+    const IconComponent = node.type === 'device' ? Server : FolderClosed
+    const iconColor = node.type === 'device' ? 'text-green-400' : 'text-yellow-500'
+
+    return (
+      <React.Fragment key={node.id}>
+        <tr className="hover:bg-gray-800/50">
+          <td className="table-td" style={{ width: treeColWidths[0] }}>
+            <button onClick={(e) => { e.stopPropagation(); toggleSelectBranch(node) }}>
+              {allSel ? <CheckSquare size={14} className="text-blue-400" />
+                : someSel ? <MinusSquare size={14} className="text-blue-400/60" />
+                : <Square size={14} className="text-gray-500" />}
+            </button>
+          </td>
+          <td className="table-td cursor-pointer" style={{ width: treeColWidths[1] }} onClick={() => toggleExpand(node.id)}>
+            <div className="flex items-center gap-1.5 font-medium" style={{ paddingLeft: indent }}>
+              {isExpanded
+                ? <ChevronDown size={14} className="text-gray-400 flex-shrink-0" />
+                : <ChevronRight size={14} className="text-gray-400 flex-shrink-0" />}
+              <IconComponent size={14} className={`${iconColor} flex-shrink-0`} />
+              <span className="text-gray-200 truncate">{node.label}</span>
+            </div>
+          </td>
+          <td className="table-td text-gray-600 text-xs" style={{ width: treeColWidths[2] }}>{'\u2014'}</td>
+          <td className="table-td" style={{ width: treeColWidths[3] }}>
+            <div className="flex items-center gap-1 flex-wrap">
+              <span className="badge badge-gray text-xs">{stats.collected}/{stats.total}</span>
+              {ni && <span className="badge badge-blue text-xs">Branch sub</span>}
+            </div>
+          </td>
+          <td className="table-td text-gray-600 text-center" style={{ width: treeColWidths[4] }}>{'\u2014'}</td>
+          <td className="table-td text-gray-600 text-xs" style={{ width: treeColWidths[5] }}>{'\u2014'}</td>
+          {ni ? (
+            <>
+              <td className="table-td" style={{ width: treeColWidths[6] }}>
+                <input className="input py-0.5 text-xs w-full"
+                  defaultValue={ni.measurement_name}
+                  onClick={e => e.stopPropagation()}
+                  onBlur={e => { if (e.target.value !== ni.measurement_name) handlePatchNodeInclude(ni, 'measurement_name', e.target.value) }}
+                  placeholder={node.label} />
+              </td>
+              <td className="table-td" style={{ width: treeColWidths[7] }}>
+                <select className="input py-0.5 text-xs w-full"
+                  value={ni.scan_class_id || ''}
+                  onClick={e => e.stopPropagation()}
+                  onChange={e => handlePatchNodeInclude(ni, 'scan_class_id', e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">None</option>
+                  {scanClasses.map(sc => <option key={sc.id} value={sc.id}>{sc.name}</option>)}
+                </select>
+              </td>
+              <td className="table-td text-center" style={{ width: treeColWidths[8] }}>
+                <input type="checkbox" checked={ni.enabled}
+                  onClick={e => e.stopPropagation()}
+                  onChange={e => handlePatchNodeInclude(ni, 'enabled', e.target.checked)}
+                  className="rounded border-gray-600 bg-gray-800 text-blue-500" />
+              </td>
+              <td className="table-td text-right" style={{ width: treeColWidths[9] }}>
+                <button onClick={(e) => { e.stopPropagation(); handleDeleteNodeInclude(ni) }} className="text-red-400 hover:text-red-300 p-1" title="Remove branch subscription">
+                  <Trash2 size={12} />
+                </button>
+              </td>
+            </>
+          ) : (
+            <>
+              <td className="table-td text-gray-600 text-xs" style={{ width: treeColWidths[6] }}>{'\u2014'}</td>
+              <td className="table-td text-gray-600 text-xs" style={{ width: treeColWidths[7] }}>{'\u2014'}</td>
+              <td className="table-td text-center text-gray-600" style={{ width: treeColWidths[8] }}>{'\u2014'}</td>
+              <td className="table-td text-right" style={{ width: treeColWidths[9] }}>
+                {node.type === 'folder' && stats.collected < stats.total && (
+                  <button onClick={(e) => {
+                    e.stopPropagation()
+                    const uncollected = getAllLeafTags(node).filter(t => !t.is_collected)
+                    if (uncollected.length === 0) return
+                    const scId = defaultScanClass?.id || null
+                    setBranchDialog({ node, uncollectedTags: uncollected, scanClassId: scId })
+                    setBranchScanClass(scId ? String(scId) : '')
+                  }} className="text-green-400 hover:text-green-300 p-1" title="Add branch to collection">
+                    <Plus size={12} />
+                  </button>
+                )}
+              </td>
+            </>
+          )}
+        </tr>
+        {isExpanded && (node.children || []).map(child => renderTreeRow(child, depth + 1))}
+      </React.Fragment>
+    )
+  }
+
+  // ── Flat table rendering (preserved from original) ──
+
+  const FlatResizeTh = ({ index, children, className = '' }) => (
+    <th className={`table-th relative ${className}`} style={{ width: flatColWidths[index], minWidth: 40 }}>
+      {children}
+      <div
+        className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-blue-500/40 z-20"
+        onMouseDown={(e) => onFlatColResize(index, e)}
+      />
+    </th>
+  )
+
+  const renderFlatTagRow = (tag, idx) => {
     const key = tKey(tag)
+    const isBranchCollected = tag.collected_via_include
     return (
       <tr key={`${key}:${idx}`} className={`hover:bg-gray-800/50 ${selected.has(key) ? 'bg-blue-900/20' : ''}`}>
-        <td className="table-td" style={{ width: colWidths[0] }}>
-          <button onClick={() => toggleSelect(key)}>
-            {selected.has(key)
-              ? <CheckSquare size={14} className="text-blue-400" />
-              : <Square size={14} className="text-gray-500" />}
-          </button>
+        <td className="table-td" style={{ width: flatColWidths[0] }}>
+          {isBranchCollected ? (
+            <CheckSquare size={14} className="text-gray-600 cursor-not-allowed" title="Managed by branch subscription" />
+          ) : (
+            <button onClick={() => toggleSelect(key)}>
+              {selected.has(key)
+                ? <CheckSquare size={14} className="text-blue-400" />
+                : <Square size={14} className="text-gray-500" />}
+            </button>
+          )}
         </td>
-        <td className="table-td text-center" style={{ width: colWidths[1] }}>
-          {tag.is_collected ? (
+        <td className="table-td text-center" style={{ width: flatColWidths[1] }}>
+          {isBranchCollected ? (
+            <span className="badge badge-purple">Branch</span>
+          ) : tag.is_collected ? (
             <span className="badge badge-green">Collected</span>
           ) : (
             <span className="badge badge-gray">Available</span>
           )}
         </td>
         {groupBy !== 'device' && (
-          <td className="table-td text-xs text-gray-400 truncate" style={{ width: colWidths[2] }}>{tag.device_name}</td>
+          <td className="table-td text-xs text-gray-400 truncate" style={{ width: flatColWidths[2] }}>{tag.device_name}</td>
         )}
-        <td className="table-td font-medium text-gray-200 truncate" style={{ width: colWidths[3] }} title={tag.display_name}>{tag.display_name}</td>
-        <td className="table-td text-xs text-gray-400 font-mono truncate" style={{ width: colWidths[4] }} title={tag.path}>{tag.path || `ns=${tag.namespace};${tag.identifier_type}=${tag.identifier}`}</td>
+        <td className="table-td font-medium text-gray-200 truncate" style={{ width: flatColWidths[3] }} title={tag.display_name}>{tag.display_name}</td>
+        <td className="table-td text-xs text-gray-400 font-mono truncate" style={{ width: flatColWidths[4] }} title={tag.path}>{tag.path || `ns=${tag.namespace};${tag.identifier_type}=${tag.identifier}`}</td>
+        <td className="table-td font-mono text-xs truncate" style={{ width: flatColWidths[5] }} title={liveValues[tag.node_id]?.status}>
+          {liveEnabled ? formatLiveValue(liveValues[tag.node_id]) : <span className="text-gray-600">{'\u2014'}</span>}
+        </td>
         {groupBy !== 'namespace' && (
-          <td className="table-td text-center" style={{ width: colWidths[5] }}><span className="badge badge-gray">{tag.namespace}</span></td>
+          <td className="table-td text-center" style={{ width: flatColWidths[6] }}><span className="badge badge-gray">{tag.namespace}</span></td>
         )}
         {groupBy !== 'data_type' && (
-          <td className="table-td text-xs text-gray-400 truncate" style={{ width: colWidths[6] }} title={tag.data_type}>{tag.data_type || '—'}</td>
+          <td className="table-td text-xs text-gray-400 truncate" style={{ width: flatColWidths[7] }} title={tag.data_type}>{tag.data_type || '\u2014'}</td>
         )}
-        {tag.is_collected ? (
+        {isBranchCollected ? (
           <>
-            <td className="table-td" style={{ width: colWidths[7] }}>
+            <td className="table-td text-gray-600 text-xs italic" style={{ width: flatColWidths[8] }}>inherited</td>
+            <td className="table-td text-gray-600 text-xs italic" style={{ width: flatColWidths[9] }}>inherited</td>
+            <td className="table-td text-center" style={{ width: flatColWidths[10] }}>
+              <input type="checkbox" checked disabled
+                className="rounded border-gray-700 bg-gray-800 text-gray-600 cursor-not-allowed" />
+            </td>
+            <td className="table-td text-right" style={{ width: flatColWidths[11] }}></td>
+          </>
+        ) : tag.is_collected ? (
+          <>
+            <td className="table-td" style={{ width: flatColWidths[8] }}>
               <input className="input py-0.5 text-xs w-full"
                 defaultValue={tag.measurement_name}
                 onBlur={e => { if (e.target.value !== tag.measurement_name) handlePatch(tag, 'measurement_name', e.target.value) }}
                 placeholder={tag.display_name} />
             </td>
-            <td className="table-td" style={{ width: colWidths[8] }}>
+            <td className="table-td" style={{ width: flatColWidths[9] }}>
               <select className="input py-0.5 text-xs w-full"
                 value={tag.scan_class_id || ''}
                 onChange={e => handlePatch(tag, 'scan_class_id', e.target.value ? Number(e.target.value) : null)}>
@@ -454,12 +1024,12 @@ export default function TagManagement() {
                 {scanClasses.map(sc => <option key={sc.id} value={sc.id}>{sc.name}</option>)}
               </select>
             </td>
-            <td className="table-td text-center" style={{ width: colWidths[9] }}>
+            <td className="table-td text-center" style={{ width: flatColWidths[10] }}>
               <input type="checkbox" checked={tag.enabled}
                 onChange={e => handlePatch(tag, 'enabled', e.target.checked)}
                 className="rounded border-gray-600 bg-gray-800 text-blue-500" />
             </td>
-            <td className="table-td text-right" style={{ width: colWidths[10] }}>
+            <td className="table-td text-right" style={{ width: flatColWidths[11] }}>
               <button onClick={() => handleRemoveFromCollection(tag)} className="text-red-400 hover:text-red-300 p-1" title="Remove from collection">
                 <Trash2 size={12} />
               </button>
@@ -467,10 +1037,10 @@ export default function TagManagement() {
           </>
         ) : (
           <>
-            <td className="table-td text-gray-600 text-xs" style={{ width: colWidths[7] }}>—</td>
-            <td className="table-td text-gray-600 text-xs" style={{ width: colWidths[8] }}>—</td>
-            <td className="table-td text-center text-gray-600" style={{ width: colWidths[9] }}>—</td>
-            <td className="table-td text-right" style={{ width: colWidths[10] }}>
+            <td className="table-td text-gray-600 text-xs" style={{ width: flatColWidths[8] }}>{'\u2014'}</td>
+            <td className="table-td text-gray-600 text-xs" style={{ width: flatColWidths[9] }}>{'\u2014'}</td>
+            <td className="table-td text-center text-gray-600" style={{ width: flatColWidths[10] }}>{'\u2014'}</td>
+            <td className="table-td text-right" style={{ width: flatColWidths[11] }}>
               <button onClick={() => handleAddToCollection([tag], defaultScanClass?.id || null)} className="text-green-400 hover:text-green-300 p-1" title="Add to collection">
                 <Plus size={12} />
               </button>
@@ -481,49 +1051,73 @@ export default function TagManagement() {
     )
   }
 
-  const tableHeaders = (
+  const flatTableHeaders = (
     <tr>
-      <ResizeTh index={0}>
+      <FlatResizeTh index={0}>
         <button onClick={toggleAll}>
           {selected.size === filtered.length && filtered.length > 0
             ? <CheckSquare size={14} className="text-blue-400" />
             : <Square size={14} className="text-gray-500" />}
         </button>
-      </ResizeTh>
-      <ResizeTh index={1} className="cursor-pointer text-center">
+      </FlatResizeTh>
+      <FlatResizeTh index={1} className="cursor-pointer text-center">
         <span className="flex items-center justify-center gap-1" onClick={() => toggleSort('is_collected')}>Status <SortIcon k="is_collected" /></span>
-      </ResizeTh>
+      </FlatResizeTh>
       {groupBy !== 'device' && (
-        <ResizeTh index={2} className="cursor-pointer">
+        <FlatResizeTh index={2} className="cursor-pointer">
           <span className="flex items-center gap-1" onClick={() => toggleSort('device_name')}>Device <SortIcon k="device_name" /></span>
-        </ResizeTh>
+        </FlatResizeTh>
       )}
-      <ResizeTh index={3} className="cursor-pointer">
+      <FlatResizeTh index={3} className="cursor-pointer">
         <span className="flex items-center gap-1" onClick={() => toggleSort('display_name')}>Tag Name <SortIcon k="display_name" /></span>
-      </ResizeTh>
-      <ResizeTh index={4} className="cursor-pointer">
+      </FlatResizeTh>
+      <FlatResizeTh index={4} className="cursor-pointer">
         <span className="flex items-center gap-1" onClick={() => toggleSort('path')}>Path <SortIcon k="path" /></span>
-      </ResizeTh>
+      </FlatResizeTh>
+      <FlatResizeTh index={5}>Value</FlatResizeTh>
       {groupBy !== 'namespace' && (
-        <ResizeTh index={5} className="cursor-pointer text-center">
+        <FlatResizeTh index={6} className="cursor-pointer text-center">
           <span className="flex items-center justify-center gap-1" onClick={() => toggleSort('namespace')}>NS <SortIcon k="namespace" /></span>
-        </ResizeTh>
+        </FlatResizeTh>
       )}
       {groupBy !== 'data_type' && (
-        <ResizeTh index={6} className="cursor-pointer">
+        <FlatResizeTh index={7} className="cursor-pointer">
           <span className="flex items-center gap-1" onClick={() => toggleSort('data_type')}>Type <SortIcon k="data_type" /></span>
-        </ResizeTh>
+        </FlatResizeTh>
       )}
-      <ResizeTh index={7}>Measurement</ResizeTh>
-      <ResizeTh index={8} className="cursor-pointer">
+      <FlatResizeTh index={8}>Measurement</FlatResizeTh>
+      <FlatResizeTh index={9} className="cursor-pointer">
         <span className="flex items-center gap-1" onClick={() => toggleSort('scan_class_name')}>Scan Class <SortIcon k="scan_class_name" /></span>
-      </ResizeTh>
-      <ResizeTh index={9} className="text-center cursor-pointer">
+      </FlatResizeTh>
+      <FlatResizeTh index={10} className="text-center cursor-pointer">
         <span className="flex items-center justify-center gap-1" onClick={() => toggleSort('enabled')}>Enabled <SortIcon k="enabled" /></span>
-      </ResizeTh>
-      <th className="table-th" style={{ width: colWidths[10], minWidth: 40 }}></th>
+      </FlatResizeTh>
+      <th className="table-th" style={{ width: flatColWidths[11], minWidth: 40 }}></th>
     </tr>
   )
+
+  const treeTableHeaders = (
+    <tr>
+      <TreeResizeTh index={0}>
+        <button onClick={toggleAll}>
+          {selected.size === filtered.length && filtered.length > 0
+            ? <CheckSquare size={14} className="text-blue-400" />
+            : <Square size={14} className="text-gray-500" />}
+        </button>
+      </TreeResizeTh>
+      <TreeResizeTh index={1}>Name</TreeResizeTh>
+      <TreeResizeTh index={2}>Value</TreeResizeTh>
+      <TreeResizeTh index={3}>Status</TreeResizeTh>
+      <TreeResizeTh index={4} className="text-center">NS</TreeResizeTh>
+      <TreeResizeTh index={5}>Type</TreeResizeTh>
+      <TreeResizeTh index={6}>Measurement</TreeResizeTh>
+      <TreeResizeTh index={7}>Scan Class</TreeResizeTh>
+      <TreeResizeTh index={8} className="text-center">Enabled</TreeResizeTh>
+      <th className="table-th" style={{ width: treeColWidths[9], minWidth: 40 }}></th>
+    </tr>
+  )
+
+  const isTreeView = groupBy === 'tree'
 
   return (
     <div className="space-y-4">
@@ -534,6 +1128,27 @@ export default function TagManagement() {
           <p className="text-sm text-gray-400 mt-1">
             {totalAvailable} discovered across {devicesWithTags} device{devicesWithTags !== 1 ? 's' : ''} · {collectedCount} collected · {enabledCount} enabled
           </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setLiveEnabled(v => !v)}
+            className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+              liveEnabled
+                ? 'bg-green-900/40 text-green-400 border border-green-700'
+                : 'btn-secondary'
+            }`}
+          >
+            <Activity size={16} className={liveEnabled ? 'animate-pulse' : ''} />
+            {liveEnabled ? 'Live (5s)' : 'Live Values'}
+          </button>
+          <button
+            onClick={refreshAllScans}
+            disabled={scanning || loading}
+            className="btn-secondary flex items-center gap-2"
+          >
+            <RefreshCw size={16} className={scanning ? 'animate-spin' : ''} />
+            {scanning ? 'Scanning...' : 'Refresh Tags'}
+          </button>
         </div>
       </div>
 
@@ -605,14 +1220,25 @@ export default function TagManagement() {
             </select>
           )}
           <div className="border-l border-gray-700 h-6 mx-1" />
-          <select className="input py-1.5 text-sm w-36" value={groupBy} onChange={e => { setGroupBy(e.target.value); setCollapsedGroups(new Set()) }}>
-            <option value="none">No Grouping</option>
+          <select className="input py-1.5 text-sm w-36" value={groupBy} onChange={e => { setGroupBy(e.target.value); setCollapsedGroups(new Set()); setSelected(new Set()) }}>
+            <option value="tree">Tree View</option>
+            <option value="flat">Flat Table</option>
             <option value="device">Group by Device</option>
             <option value="scan_class">Group by Scan Class</option>
             <option value="namespace">Group by Namespace</option>
             <option value="data_type">Group by Data Type</option>
             <option value="status">Group by Status</option>
           </select>
+          {isTreeView && (
+            <>
+              <button onClick={expandAll} className="btn-ghost py-1 px-2 text-xs flex items-center gap-1" title="Expand all">
+                <ChevronsUpDown size={14} />
+              </button>
+              <button onClick={collapseAll} className="btn-ghost py-1 px-2 text-xs flex items-center gap-1" title="Collapse all">
+                <ChevronsDownUp size={14} />
+              </button>
+            </>
+          )}
           <span className="text-sm text-gray-500 ml-auto">{filtered.length} / {totalAvailable}</span>
         </div>
       </div>
@@ -671,12 +1297,31 @@ export default function TagManagement() {
           <p className="font-medium text-gray-300">No tags discovered</p>
           <p className="text-sm mt-1">Scan devices from the OPC UA Devices page to discover available tags</p>
         </div>
+      ) : isTreeView ? (
+        /* ── Tree View ── */
+        <div className="card overflow-hidden">
+          <div className="overflow-x-auto max-h-[75vh] overflow-y-auto">
+            <table className="w-full text-sm table-fixed" key={`tree-${viewMode}`}>
+              <thead className="bg-gray-800/50 border-b border-gray-700 sticky top-0 z-10">
+                {treeTableHeaders}
+              </thead>
+              <tbody className="divide-y divide-gray-800">
+                {tree.length > 0 ? (
+                  tree.map(deviceNode => renderTreeRow(deviceNode, 0))
+                ) : (
+                  <tr><td colSpan={99} className="table-td text-center text-gray-500 py-8">No tags match the filters</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
       ) : (
+        /* ── Flat / Grouped View ── */
         <div className="card overflow-hidden">
           <div className="overflow-x-auto max-h-[75vh] overflow-y-auto">
             <table className="w-full text-sm table-fixed" key={`${viewMode}-${groupBy}`}>
               <thead className="bg-gray-800/50 border-b border-gray-700 sticky top-0 z-10">
-                {tableHeaders}
+                {flatTableHeaders}
               </thead>
               {groups ? (
                 groups.map(([groupName, groupTags]) => {
@@ -694,13 +1339,13 @@ export default function TagManagement() {
                           </div>
                         </td>
                       </tr>
-                      {!isCollapsed && groupTags.map((tag, idx) => renderTagRow(tag, idx))}
+                      {!isCollapsed && groupTags.map((tag, idx) => renderFlatTagRow(tag, idx))}
                     </tbody>
                   )
                 })
               ) : (
                 <tbody className="divide-y divide-gray-800">
-                  {filtered.map((tag, idx) => renderTagRow(tag, idx))}
+                  {filtered.map((tag, idx) => renderFlatTagRow(tag, idx))}
                   {filtered.length === 0 && (
                     <tr><td colSpan={99} className="table-td text-center text-gray-500 py-8">No tags match the filters</td></tr>
                   )}
@@ -710,6 +1355,75 @@ export default function TagManagement() {
           </div>
         </div>
       )}
+
+      {/* Branch subscription dialog */}
+      <Modal
+        open={!!branchDialog}
+        onClose={() => setBranchDialog(null)}
+        title="Add Branch to Collection"
+        size="md"
+      >
+        {branchDialog && (
+          <div className="space-y-4">
+            <p className="text-sm text-gray-300">
+              You selected the branch{' '}
+              <span className="font-mono font-medium text-gray-100">
+                {branchDialog.node.path || branchDialog.node.label}
+              </span>{' '}
+              which contains{' '}
+              <span className="font-semibold">{branchDialog.uncollectedTags.length}</span>{' '}
+              uncollected tag{branchDialog.uncollectedTags.length !== 1 ? 's' : ''}.
+            </p>
+
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">Scan Class</label>
+              <select className="input py-1.5 text-sm w-full" value={branchScanClass} onChange={e => setBranchScanClass(e.target.value)}>
+                <option value="">{defaultScanClass ? `Default: ${defaultScanClass.name}` : 'None'}</option>
+                {scanClasses.map(sc => <option key={sc.id} value={sc.id}>{sc.name}{sc.is_default ? ' (default)' : ''}</option>)}
+              </select>
+            </div>
+
+            <p className="text-sm text-gray-400">
+              Choose how to add these tags:
+            </p>
+
+            <div className="space-y-3">
+              <button
+                onClick={async () => {
+                  const scId = branchScanClass ? Number(branchScanClass) : (branchDialog.scanClassId || null)
+                  await handleAddToCollection(branchDialog.uncollectedTags, scId)
+                  setSelected(new Set())
+                  setBranchDialog(null)
+                }}
+                className="w-full text-left p-4 rounded-lg border border-gray-700 hover:border-blue-500 hover:bg-blue-900/10 transition-colors"
+              >
+                <div className="font-medium text-gray-200">Expand to individual tags</div>
+                <p className="text-xs text-gray-400 mt-1">
+                  Each tag is saved individually. You can configure measurement name, scan class, and enabled status per tag.
+                  Best for fine-grained control.
+                </p>
+              </button>
+
+              <button
+                onClick={async () => {
+                  const scId = branchScanClass ? Number(branchScanClass) : (branchDialog.scanClassId || null)
+                  await handleAddBranchSubscription(branchDialog.node, scId)
+                  setSelected(new Set())
+                  setBranchDialog(null)
+                }}
+                className="w-full text-left p-4 rounded-lg border border-gray-700 hover:border-green-500 hover:bg-green-900/10 transition-colors"
+              >
+                <div className="font-medium text-gray-200">Subscribe as branch</div>
+                <p className="text-xs text-gray-400 mt-1">
+                  Saves a single branch subscription. All tags under this path are included automatically when
+                  generating the Telegraf config. New tags added to the server under this path will be picked up
+                  on the next scan.
+                </p>
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

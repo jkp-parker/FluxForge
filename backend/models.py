@@ -23,6 +23,7 @@ class ScanClass(Base):
     is_default = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     tags = relationship("Tag", back_populates="scan_class")
+    node_includes = relationship("NodeInclude", back_populates="scan_class")
 
 
 class InfluxDBConfig(Base):
@@ -56,6 +57,7 @@ class Device(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     influxdb_config = relationship("InfluxDBConfig", back_populates="devices")
     tags = relationship("Tag", back_populates="device", cascade="all, delete-orphan")
+    node_includes = relationship("NodeInclude", back_populates="device", cascade="all, delete-orphan")
 
 
 class Tag(Base):
@@ -76,3 +78,22 @@ class Tag(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     device = relationship("Device", back_populates="tags")
     scan_class = relationship("ScanClass", back_populates="tags")
+
+
+class NodeInclude(Base):
+    __tablename__ = "node_includes"
+
+    id = Column(Integer, primary_key=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    parent_node_id = Column(String, nullable=False)
+    parent_path = Column(String, default="")
+    namespace = Column(Integer, default=0)
+    identifier = Column(String, default="")
+    identifier_type = Column(String, default="s")
+    display_name = Column(String, nullable=False)
+    measurement_name = Column(String, default="")
+    scan_class_id = Column(Integer, ForeignKey("scan_classes.id"), nullable=True)
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    device = relationship("Device", back_populates="node_includes")
+    scan_class = relationship("ScanClass", back_populates="node_includes")

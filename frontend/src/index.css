@@ -61,4 +61,7 @@
   .badge-yellow {
     @apply badge bg-yellow-900/50 text-yellow-400;
   }
+  .badge-purple {
+    @apply badge bg-purple-900/50 text-purple-400;
+  }
 }

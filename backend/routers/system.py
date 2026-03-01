@@ -26,6 +26,14 @@ DEFAULTS = {
     "telegraf_config_path": "/etc/telegraf/telegraf.conf",
     "telegraf_reload_command": "systemctl reload telegraf",
     "app_title": "FluxForge",
+    "agent_round_interval": "true",
+    "agent_metric_batch_size": "1000",
+    "agent_metric_buffer_limit": "10000",
+    "agent_collection_jitter": "0s",
+    "agent_flush_interval": "10s",
+    "agent_flush_jitter": "0s",
+    "agent_hostname": "",
+    "agent_omit_hostname": "false",
 }
 
 
@@ -58,6 +66,14 @@ def get_config(db: Session = Depends(get_db)):
         telegraf_config_path=cfg.get("telegraf_config_path", "/etc/telegraf/telegraf.conf"),
         telegraf_reload_command=cfg.get("telegraf_reload_command", "systemctl reload telegraf"),
         app_title=cfg.get("app_title", "FluxForge"),
+        agent_round_interval=cfg.get("agent_round_interval", "true").lower() == "true",
+        agent_metric_batch_size=int(cfg.get("agent_metric_batch_size", "1000")),
+        agent_metric_buffer_limit=int(cfg.get("agent_metric_buffer_limit", "10000")),
+        agent_collection_jitter=cfg.get("agent_collection_jitter", "0s"),
+        agent_flush_interval=cfg.get("agent_flush_interval", "10s"),
+        agent_flush_jitter=cfg.get("agent_flush_jitter", "0s"),
+        agent_hostname=cfg.get("agent_hostname", ""),
+        agent_omit_hostname=cfg.get("agent_omit_hostname", "false").lower() == "true",
     )
 
 
@@ -72,6 +88,14 @@ def update_config(payload: schemas.SystemConfigUpdate, db: Session = Depends(get
         "telegraf_reload_command": payload.telegraf_reload_command or "systemctl reload telegraf",
         "app_title": payload.app_title or "FluxForge",
         "setup_complete": "true",
+        "agent_round_interval": str(payload.agent_round_interval).lower(),
+        "agent_metric_batch_size": str(payload.agent_metric_batch_size),
+        "agent_metric_buffer_limit": str(payload.agent_metric_buffer_limit),
+        "agent_collection_jitter": payload.agent_collection_jitter or "0s",
+        "agent_flush_interval": payload.agent_flush_interval or "10s",
+        "agent_flush_jitter": payload.agent_flush_jitter or "0s",
+        "agent_hostname": payload.agent_hostname or "",
+        "agent_omit_hostname": str(payload.agent_omit_hostname).lower(),
     }
     for key, value in fields.items():
         _set_key(db, key, value)

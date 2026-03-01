@@ -3,12 +3,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
+import threading
+import logging
 
 from sqlalchemy import inspect, text
-from database import engine, Base
+from database import engine, Base, SessionLocal
 import models  # noqa: F401 — ensures all models are registered
 from routers import system, devices, scan_classes, influxdb_config, metrics, telegraf
 from services.opcua_certs import ensure_certs_exist
+
+logger = logging.getLogger(__name__)
 
 # Create all tables
 Base.metadata.create_all(bind=engine)
@@ -54,6 +58,41 @@ app.include_router(scan_classes.router, prefix="/api")
 app.include_router(influxdb_config.router, prefix="/api")
 app.include_router(metrics.router, prefix="/api")
 app.include_router(telegraf.router, prefix="/api")
+
+# Auto-scan devices with NodeIncludes on startup so tags are populated
+def _startup_scan():
+    """Background thread: scan devices that have branch subscriptions."""
+    db = SessionLocal()
+    try:
+        device_ids = [
+            r[0] for r in db.query(models.NodeInclude.device_id).distinct().all()
+        ]
+        if not device_ids:
+            return
+
+        for device_id in device_ids:
+            device = db.query(models.Device).filter(
+                models.Device.id == device_id, models.Device.enabled == True
+            ).first()
+            if not device:
+                continue
+            logger.info(f"Startup scan: {device.name} (id={device.id})")
+            try:
+                devices._do_scan(
+                    device.id, device.endpoint_url, device.username, device.password,
+                    security_policy=device.security_policy or "None",
+                )
+            except Exception as e:
+                logger.warning(f"Startup scan failed for {device.name}: {e}")
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    thread = threading.Thread(target=_startup_scan, daemon=True)
+    thread.start()
+
 
 # Serve built React frontend from /app/static
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")

@@ -229,3 +229,50 @@ def browse_node(endpoint_url: str, node_id: Optional[str] = None, username: str 
 
 def scan_all_variables(endpoint_url: str, username: str = "", password: str = "", security_policy: str = "None", max_depth: int = 8) -> List[Dict]:
     return _run_async(_scan_all_variables_async(endpoint_url, username, password, security_policy, max_depth))
+
+
+async def _read_values_async(
+    endpoint_url: str,
+    node_ids: List[str],
+    username: str = "",
+    password: str = "",
+    security_policy: str = "None",
+) -> Dict[str, Dict]:
+    try:
+        from asyncua import Client, ua
+
+        client = Client(url=endpoint_url, timeout=15)
+        await _configure_client(client, security_policy, username, password)
+
+        results = {}
+        async with client:
+            for nid_str in node_ids:
+                try:
+                    node = client.get_node(nid_str)
+                    dv = await node.read_data_value()
+                    val = dv.Value.Value
+                    # Convert non-JSON-serializable types
+                    if isinstance(val, (bytes, bytearray)):
+                        val = val.hex()
+                    elif hasattr(val, 'isoformat'):
+                        val = val.isoformat()
+                    elif isinstance(val, float):
+                        if val != val:  # NaN
+                            val = None
+                    results[nid_str] = {
+                        "value": val,
+                        "status": dv.StatusCode.name if dv.StatusCode else "Good",
+                        "timestamp": dv.SourceTimestamp.isoformat() if dv.SourceTimestamp else None,
+                    }
+                except Exception as e:
+                    results[nid_str] = {"value": None, "status": f"Error: {e}", "timestamp": None}
+
+        return results
+    except ImportError:
+        raise RuntimeError("asyncua library not installed")
+    except Exception as e:
+        raise RuntimeError(f"Read values failed: {e}")
+
+
+def read_values(endpoint_url: str, node_ids: List[str], username: str = "", password: str = "", security_policy: str = "None") -> Dict[str, Dict]:
+    return _run_async(_read_values_async(endpoint_url, node_ids, username, password, security_policy))
