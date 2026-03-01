@@ -9,7 +9,7 @@ import {
   deleteInfluxConfig, testInfluxConfig, testInfluxConnectionRaw, listBuckets,
 } from '../services/api'
 
-const EMPTY = { name: '', url: 'http://influxdb:8086', token: '', org: '', bucket: '', is_default: false }
+const EMPTY = { name: '', url: 'http://influxdb:8086', token: '', org: '', bucket: '', version: 2, is_default: false }
 
 export default function InfluxConfig() {
   const [configs, setConfigs] = useState([])
@@ -33,13 +33,13 @@ export default function InfluxConfig() {
 
   const openAdd = () => { setForm(EMPTY); setEditTarget(null); setError(''); setModalTestResult(null); setModal('form') }
   const openEdit = (cfg) => {
-    setForm({ name: cfg.name, url: cfg.url, token: cfg.token, org: cfg.org, bucket: cfg.bucket, is_default: cfg.is_default })
+    setForm({ name: cfg.name, url: cfg.url, token: cfg.token, org: cfg.org, bucket: cfg.bucket, version: cfg.version || 2, is_default: cfg.is_default })
     setEditTarget(cfg); setError(''); setModalTestResult(null); setModal('form')
   }
 
   const handleSave = async () => {
-    if (!form.name || !form.url || !form.token || !form.org || !form.bucket) {
-      setError('All fields are required'); return
+    if (!form.name || !form.url || !form.token || !form.bucket || (form.version === 2 && !form.org)) {
+      setError('All required fields must be filled'); return
     }
     setSaving(true); setError('')
     try {
@@ -77,8 +77,8 @@ export default function InfluxConfig() {
   }
 
   const handleModalTest = async () => {
-    if (!form.url || !form.token || !form.org) {
-      setModalTestResult({ success: false, message: 'Enter URL, token and organisation first' }); return
+    if (!form.url || !form.token || (form.version === 2 && !form.org)) {
+      setModalTestResult({ success: false, message: form.version === 2 ? 'Enter URL, token and organisation first' : 'Enter URL and token first' }); return
     }
     setModalTesting(true); setModalTestResult(null)
     try {
@@ -121,12 +121,14 @@ export default function InfluxConfig() {
           {configs.map(cfg => {
             const tr = testResults[cfg.id]
             const cfgBuckets = buckets[cfg.id]
+            const isV3 = cfg.version === 3
             return (
               <div key={cfg.id} className="card p-5">
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-2">
                       <h3 className="font-semibold text-gray-100 text-lg">{cfg.name}</h3>
+                      <span className="badge badge-blue text-[10px]">v{cfg.version || 2}</span>
                       {cfg.is_default && (
                         <span className="badge badge-yellow flex items-center gap-1">
                           <Star size={10} /> Default
@@ -134,17 +136,19 @@ export default function InfluxConfig() {
                       )}
                       <span className="badge badge-gray">{cfg.device_count} devices</span>
                     </div>
-                    <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+                    <div className={`mt-2 grid grid-cols-2 ${isV3 ? 'sm:grid-cols-3' : 'sm:grid-cols-4'} gap-3 text-sm`}>
                       <div>
                         <span className="text-gray-500 text-xs">URL</span>
                         <p className="font-mono text-gray-300 text-xs break-all">{cfg.url}</p>
                       </div>
+                      {!isV3 && (
+                        <div>
+                          <span className="text-gray-500 text-xs">Organisation</span>
+                          <p className="text-gray-300">{cfg.org}</p>
+                        </div>
+                      )}
                       <div>
-                        <span className="text-gray-500 text-xs">Organisation</span>
-                        <p className="text-gray-300">{cfg.org}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-500 text-xs">Bucket</span>
+                        <span className="text-gray-500 text-xs">{isV3 ? 'Database' : 'Bucket'}</span>
                         <p className="text-gray-200 font-medium">{cfg.bucket}</p>
                       </div>
                       <div>
@@ -163,7 +167,7 @@ export default function InfluxConfig() {
                     {cfgBuckets && (
                       <div className="mt-3 flex flex-wrap gap-1.5">
                         {cfgBuckets.length === 0
-                          ? <span className="text-xs text-gray-500">No buckets found</span>
+                          ? <span className="text-xs text-gray-500">No {isV3 ? 'databases' : 'buckets'} found</span>
                           : cfgBuckets.map(b => (
                               <span key={b} className={`badge ${b === cfg.bucket ? 'badge-blue' : 'badge-gray'}`}>{b}</span>
                             ))
@@ -179,7 +183,7 @@ export default function InfluxConfig() {
                     </button>
                     <button onClick={() => handleListBuckets(cfg.id)} disabled={loadingBuckets === cfg.id} className="btn-secondary py-1 text-xs">
                       {loadingBuckets === cfg.id ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                      Buckets
+                      {isV3 ? 'Databases' : 'Buckets'}
                     </button>
                     <button onClick={() => openEdit(cfg)} className="btn-ghost py-1 px-2"><Pencil size={13} /></button>
                     <button onClick={() => handleDelete(cfg.id)} className="btn-ghost py-1 px-2 text-red-400 hover:bg-red-900/30">
@@ -197,6 +201,27 @@ export default function InfluxConfig() {
         title={editTarget ? 'Edit InfluxDB Connection' : 'Add InfluxDB Connection'}>
         <div className="space-y-4">
           <div>
+            <label className="label">InfluxDB Version *</label>
+            <div className="flex gap-3 mt-1">
+              {[2, 3].map(v => (
+                <label key={v} className={`flex items-center gap-2 px-4 py-2 rounded-lg border cursor-pointer transition-colors ${
+                  form.version === v
+                    ? 'border-blue-500 bg-blue-900/20 text-blue-400'
+                    : 'border-gray-700 bg-gray-800/50 text-gray-400 hover:border-gray-600'
+                }`}>
+                  <input
+                    type="radio"
+                    name="influx_version"
+                    checked={form.version === v}
+                    onChange={() => set('version', v)}
+                    className="sr-only"
+                  />
+                  <span className="text-sm font-medium">InfluxDB {v}.x</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <div>
             <label className="label">Connection Name *</label>
             <input className="input" value={form.name} onChange={e => set('name', e.target.value)} placeholder="Production InfluxDB" />
           </div>
@@ -208,16 +233,23 @@ export default function InfluxConfig() {
             <label className="label">API Token *</label>
             <input className="input" type="password" value={form.token} onChange={e => set('token', e.target.value)} placeholder="your-api-token" />
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="label">Organisation *</label>
-              <input className="input" value={form.org} onChange={e => set('org', e.target.value)} placeholder="myorg" />
+          {form.version === 2 ? (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Organisation *</label>
+                <input className="input" value={form.org} onChange={e => set('org', e.target.value)} placeholder="myorg" />
+              </div>
+              <div>
+                <label className="label">Default Bucket *</label>
+                <input className="input" value={form.bucket} onChange={e => set('bucket', e.target.value)} placeholder="opcua" />
+              </div>
             </div>
+          ) : (
             <div>
-              <label className="label">Default Bucket *</label>
+              <label className="label">Default Database *</label>
               <input className="input" value={form.bucket} onChange={e => set('bucket', e.target.value)} placeholder="opcua" />
             </div>
-          </div>
+          )}
           <div className="flex items-center gap-2">
             <input type="checkbox" id="is_default" checked={form.is_default} onChange={e => set('is_default', e.target.checked)} className="rounded border-gray-600 bg-gray-800 text-blue-500" />
             <label htmlFor="is_default" className="text-sm text-gray-300">Set as default for new devices</label>

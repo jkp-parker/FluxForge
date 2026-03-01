@@ -59,8 +59,9 @@ class InfluxDBConfigBase(BaseModel):
     name: str
     url: str
     token: str
-    org: str
+    org: Optional[str] = ""
     bucket: str
+    version: Optional[int] = 2
     is_default: Optional[bool] = False
 
 
@@ -160,7 +161,7 @@ class OpcuaTestRequest(BaseModel):
 class InfluxTestRequest(BaseModel):
     url: str
     token: str
-    org: str
+    org: Optional[str] = ""
 
 
 class OpcuaNodeOut(BaseModel):

@@ -1,7 +1,7 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard, Server, Tag, Clock, Database,
-  FileCode, Settings, Activity,
+  FileCode, Settings, Link,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { getSystemConfig } from '../services/api'
@@ -56,7 +56,7 @@ export default function Layout({ children }) {
       {/* Sidebar */}
       <aside className="w-56 flex-shrink-0 bg-gray-900 border-r border-gray-800 flex flex-col">
         <div className="flex items-center gap-2 px-4 py-4 border-b border-gray-800">
-          <Activity size={22} className="text-blue-400" />
+          <Link size={22} className="text-blue-400" />
           <span className="text-white font-semibold text-sm leading-tight">{title}</span>
         </div>
         <nav className="flex-1 py-4 space-y-0.5 px-2">

@@ -22,6 +22,12 @@ def _migrate():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE scan_classes ADD COLUMN is_default BOOLEAN DEFAULT 0"))
 
+    if "influxdb_configs" in insp.get_table_names():
+        cols = [c["name"] for c in insp.get_columns("influxdb_configs")]
+        if "version" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE influxdb_configs ADD COLUMN version INTEGER DEFAULT 2"))
+
 _migrate()
 
 # Generate OPC UA client certificate if it doesn't exist

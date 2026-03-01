@@ -18,12 +18,12 @@ function StatCard({ icon: Icon, label, value, sub, color = 'blue', to }) {
     purple: 'bg-purple-900/40 text-purple-400',
   }
   const inner = (
-    <div className="card p-5 hover:border-gray-600 transition-colors">
-      <div className="flex items-start justify-between">
+    <div className="card p-5 h-full hover:border-gray-600 transition-colors">
+      <div className="flex items-start justify-between h-full">
         <div>
           <p className="text-sm text-gray-400 font-medium">{label}</p>
           <p className="text-3xl font-bold text-gray-100 mt-1">{value}</p>
-          {sub && <p className="text-xs text-gray-500 mt-1">{sub}</p>}
+          <p className={`text-xs mt-1 ${sub ? 'text-gray-500' : 'invisible'}`}>{sub || '\u00A0'}</p>
         </div>
         <div className={`p-2.5 rounded-lg ${colorMap[color]}`}>
           <Icon size={20} />
