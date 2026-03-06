@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from database import get_db
 import models
 
@@ -14,6 +15,7 @@ def get_metrics(db: Session = Depends(get_db)):
     enabled_tags = db.query(models.Tag).filter(models.Tag.enabled == True).count()
     scan_class_count = db.query(models.ScanClass).count()
     influxdb_count = db.query(models.InfluxDBConfig).count()
+    instance_count = db.query(models.TelegrafInstance).count()
 
     # Tags per scan class
     scan_classes = db.query(models.ScanClass).order_by(models.ScanClass.interval_ms).all()
@@ -38,7 +40,63 @@ def get_metrics(db: Session = Depends(get_db)):
             "tag_count": unassigned_tags,
         })
 
-    # Devices with their tag counts and influxdb targets
+    # Tags grouped by instance AND scan class (for sankey diagram)
+    instances = db.query(models.TelegrafInstance).order_by(models.TelegrafInstance.name).all()
+    instance_map = {inst.id: inst.name for inst in instances}
+
+    tags_by_instance_scan_class = []
+    for inst in instances:
+        for sc in scan_classes:
+            count = db.query(models.Tag).filter(
+                models.Tag.telegraf_instance_id == inst.id,
+                models.Tag.scan_class_id == sc.id,
+                models.Tag.enabled == True,
+            ).count()
+            if count > 0:
+                tags_by_instance_scan_class.append({
+                    "instance_name": inst.name,
+                    "scan_class_name": sc.name,
+                    "tag_count": count,
+                })
+        # Unassigned scan class for this instance
+        count = db.query(models.Tag).filter(
+            models.Tag.telegraf_instance_id == inst.id,
+            models.Tag.scan_class_id == None,
+            models.Tag.enabled == True,
+        ).count()
+        if count > 0:
+            tags_by_instance_scan_class.append({
+                "instance_name": inst.name,
+                "scan_class_name": "Unassigned",
+                "tag_count": count,
+            })
+
+    # Tags with no instance assigned
+    for sc in scan_classes:
+        count = db.query(models.Tag).filter(
+            models.Tag.telegraf_instance_id == None,
+            models.Tag.scan_class_id == sc.id,
+            models.Tag.enabled == True,
+        ).count()
+        if count > 0:
+            tags_by_instance_scan_class.append({
+                "instance_name": "Unassigned",
+                "scan_class_name": sc.name,
+                "tag_count": count,
+            })
+    count = db.query(models.Tag).filter(
+        models.Tag.telegraf_instance_id == None,
+        models.Tag.scan_class_id == None,
+        models.Tag.enabled == True,
+    ).count()
+    if count > 0:
+        tags_by_instance_scan_class.append({
+            "instance_name": "Unassigned",
+            "scan_class_name": "Unassigned",
+            "tag_count": count,
+        })
+
+    # Devices with their tag counts, influxdb targets, and instance names
     devices = db.query(models.Device).order_by(models.Device.name).all()
     device_summary = []
     for d in devices:
@@ -52,6 +110,13 @@ def get_metrics(db: Session = Depends(get_db)):
             ).first()
             if cfg:
                 influx_name = cfg.name
+        instance_name = None
+        if d.telegraf_instance_id:
+            inst = db.query(models.TelegrafInstance).filter(
+                models.TelegrafInstance.id == d.telegraf_instance_id
+            ).first()
+            if inst:
+                instance_name = inst.name
         device_summary.append({
             "id": d.id,
             "name": d.name,
@@ -59,6 +124,7 @@ def get_metrics(db: Session = Depends(get_db)):
             "enabled": d.enabled,
             "enabled_tag_count": tag_count,
             "influxdb_name": influx_name,
+            "instance_name": instance_name,
         })
 
     # InfluxDB config summaries
@@ -68,6 +134,10 @@ def get_metrics(db: Session = Depends(get_db)):
         device_count = db.query(models.Device).filter(
             models.Device.influxdb_config_id == cfg.id
         ).count()
+        tag_count = db.query(models.Tag).join(models.Device).filter(
+            models.Device.influxdb_config_id == cfg.id,
+            models.Tag.enabled == True,
+        ).count()
         influx_summary.append({
             "id": cfg.id,
             "name": cfg.name,
@@ -76,7 +146,76 @@ def get_metrics(db: Session = Depends(get_db)):
             "bucket": cfg.bucket,
             "is_default": cfg.is_default,
             "device_count": device_count,
+            "tag_count": tag_count,
         })
+
+    # Instance summaries
+    instance_summary = []
+    for inst in instances:
+        device_count = db.query(models.Device).filter(
+            models.Device.telegraf_instance_id == inst.id
+        ).count()
+        tag_count = db.query(models.Tag).filter(
+            models.Tag.telegraf_instance_id == inst.id,
+            models.Tag.enabled == True,
+        ).count()
+        instance_summary.append({
+            "id": inst.id,
+            "name": inst.name,
+            "enabled": inst.enabled,
+            "device_count": device_count,
+            "tag_count": tag_count,
+        })
+
+    # Flow diagram data: devices -> instances -> influx targets
+    flow_links = []
+    for d in devices:
+        if not d.enabled:
+            continue
+        tag_count_for_device = db.query(models.Tag).filter(
+            models.Tag.device_id == d.id, models.Tag.enabled == True
+        ).count()
+        inst_name = None
+        if d.telegraf_instance_id:
+            inst_name = instance_map.get(d.telegraf_instance_id)
+        if inst_name and tag_count_for_device > 0:
+            flow_links.append({
+                "source_type": "device",
+                "source": d.name,
+                "target_type": "instance",
+                "target": inst_name,
+                "tag_count": tag_count_for_device,
+            })
+
+    for inst in instances:
+        if not inst.enabled:
+            continue
+        # Find unique influx targets for devices in this instance
+        inst_devices = db.query(models.Device).filter(
+            models.Device.telegraf_instance_id == inst.id,
+            models.Device.enabled == True,
+        ).all()
+        influx_tag_counts = {}
+        for d in inst_devices:
+            if d.influxdb_config_id:
+                cfg = db.query(models.InfluxDBConfig).filter(
+                    models.InfluxDBConfig.id == d.influxdb_config_id
+                ).first()
+                if cfg:
+                    tc = db.query(models.Tag).filter(
+                        models.Tag.device_id == d.id,
+                        models.Tag.enabled == True,
+                    ).count()
+                    influx_tag_counts[cfg.name] = influx_tag_counts.get(cfg.name, 0) + tc
+        for influx_name, tc in influx_tag_counts.items():
+            if tc > 0:
+                flow_links.append({
+                    "source_type": "instance",
+                    "source": inst.name,
+                    "target_type": "influx",
+                    "target": influx_name,
+                    "tag_count": tc,
+                })
 
     return {
         "total_devices": total_devices,
@@ -85,7 +224,11 @@ def get_metrics(db: Session = Depends(get_db)):
         "enabled_tags": enabled_tags,
         "scan_class_count": scan_class_count,
         "influxdb_count": influxdb_count,
+        "instance_count": instance_count,
         "tags_by_scan_class": tags_by_scan_class,
+        "tags_by_instance_scan_class": tags_by_instance_scan_class,
         "device_summary": device_summary,
         "influx_summary": influx_summary,
+        "instance_summary": instance_summary,
+        "flow_links": flow_links,
     }
