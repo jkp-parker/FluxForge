@@ -32,5 +32,10 @@ Thumbs.db
 .idea/
 *.swp
 
+# Data / credentials
+data/opcua_client_cert.*
+data/opcua_client_key.*
+data/telegraf-configs/
+
 # Claude
 .claude/
